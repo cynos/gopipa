@@ -16,6 +16,7 @@ type Stage interface {
 	GetWorkerindex() int
 	IsDataClosed() bool
 	SetData(d interface{})
+	GetData() Chan
 }
 
 type stage struct {
@@ -26,12 +27,20 @@ type stage struct {
 	ExecFn      execFn
 }
 
+func (s stage) GetData() Chan {
+	return s.Data
+}
+
 func (s stage) SetData(d interface{}) {
 	s.Data <- d
 }
 
 func (s stage) CloseData() {
-	close(s.Data)
+	for d := range s.Data {
+		if d == nil {
+			close(s.Data)
+		}
+	}
 }
 
 func (s stage) IsDataClosed() bool {
