@@ -2,7 +2,7 @@ package pipa
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"sync"
 )
 
@@ -13,37 +13,41 @@ type execFn func(ctx context.Context, s Stage)
 type Stage interface {
 	CloseData()
 	GetStageID() string
-	GetWorkerindex() int
 	IsDataClosed() bool
+	GetWorkerActiveCount() int
 	SetData(d interface{})
 	GetData() Chan
+	CatchPanic(func(error))
 }
 
 type stage struct {
-	ID          string
-	WorkerIndex int
-	WorkerCount int
-	Data        Chan
-	ExecFn      execFn
+	ID           string
+	Position     int
+	WorkerCount  int
+	WorkerActive int
+	Data         Chan
+	ExecFn       execFn
 }
 
-func (s stage) GetData() Chan {
+func (s *stage) GetData() Chan {
 	return s.Data
 }
 
-func (s stage) SetData(d interface{}) {
+func (s *stage) SetData(d interface{}) {
 	s.Data <- d
 }
 
-func (s stage) CloseData() {
-	for d := range s.Data {
-		if d == nil {
-			close(s.Data)
-		}
+func (s *stage) GetWorkerActiveCount() int {
+	return s.WorkerActive
+}
+
+func (s *stage) CloseData() {
+	if !s.IsDataClosed() {
+		close(s.Data)
 	}
 }
 
-func (s stage) IsDataClosed() bool {
+func (s *stage) IsDataClosed() bool {
 	select {
 	case <-s.Data:
 		return true
@@ -52,18 +56,22 @@ func (s stage) IsDataClosed() bool {
 	return false
 }
 
-func (s stage) GetWorkerindex() int {
-	return s.WorkerIndex
+func (s *stage) GetStageID() string {
+	return s.ID
 }
 
-func (s stage) GetStageID() string {
-	return s.ID
+func (s *stage) CatchPanic(fn func(error)) {
+	if r := recover(); r != nil {
+		fn(fmt.Errorf("%v", r))
+	}
 }
 
 type Pipeliner interface {
 	AddStage(id string, worker int, fn execFn)
 	Start()
-	GetDataFromStage(id string) Chan
+	GetDataStageFrom(id string) Chan
+	GetStageFrom(id string) Stage
+	GetAllStage() []Stage
 }
 
 type pipeline struct {
@@ -92,7 +100,24 @@ func (p *pipeline) AddStage(id string, worker int, fn execFn) {
 	})
 }
 
-func (p *pipeline) GetDataFromStage(id string) Chan {
+func (p *pipeline) GetAllStage() []Stage {
+	stages := []Stage{}
+	for _, v := range p.stages {
+		stages = append(stages, &v)
+	}
+	return stages
+}
+
+func (p *pipeline) GetStageFrom(id string) Stage {
+	for _, s := range p.stages {
+		if s.ID == id {
+			return &s
+		}
+	}
+	return nil
+}
+
+func (p *pipeline) GetDataStageFrom(id string) Chan {
 	for _, s := range p.stages {
 		if s.ID == id {
 			return s.Data
@@ -102,27 +127,24 @@ func (p *pipeline) GetDataFromStage(id string) Chan {
 }
 
 func (p *pipeline) Start() {
-	wg := sync.WaitGroup{}
-	for _, v := range p.stages {
-		log.Println("running stage :", v.ID)
-		wg.Add(1)
-		go func(s stage) {
-			defer wg.Done()
-			defer log.Println("closing stage :", s.ID)
-			w2 := sync.WaitGroup{}
-			for i := 0; i < s.WorkerCount; i++ {
-				w2.Add(1)
-				s.WorkerIndex = i
-				go exec(p.ctx, &w2, s)
-			}
-			w2.Wait()
-			s.CloseData()
-		}(v)
+	w := sync.WaitGroup{}
+	for pos, s := range p.stages {
+		s.Position = pos
+		for i := 0; i < s.WorkerCount; i++ {
+			w.Add(1)
+			s.WorkerActive += 1
+			go exec(p.ctx, &w, s)
+		}
 	}
-	wg.Wait()
+	w.Wait()
+	// make sure all channel closed when all stages is completed
+	for _, v := range p.stages {
+		v.CloseData()
+	}
 }
 
 func exec(ctx context.Context, wg *sync.WaitGroup, s stage) {
 	defer wg.Done()
-	s.ExecFn(ctx, s)
+	s.ExecFn(ctx, &s)
+	s.WorkerActive -= 1
 }
