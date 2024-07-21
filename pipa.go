@@ -171,7 +171,7 @@ func (p *pipeline) AddStage(id string, numWorkers int, fn stageFn) {
 	if numWorkers == 1 {
 		mch = wch[0]
 	} else {
-		mch = make(chan interface{})
+		mch = make(chan interface{}, numWorkers)
 	}
 
 	p.stages = append(p.stages, &stage{
