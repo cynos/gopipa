@@ -99,8 +99,8 @@ func TestEmptyNextStage(t *testing.T) {
 		}
 	}()
 	pipe := NewPipeline(context.Background())
-	pipe.AddStage("numb", 1, func(ctx context.Context, s Stage, wi int) {
-		for d := range s.NextStage().GetData() {
+	pipe.AddStage("numb", 1, func(ctx context.Context, s Stage, ch Channel) {
+		for d := range s.NextStage().GetMainChannel() {
 			fmt.Println(d)
 		}
 	})
@@ -111,39 +111,30 @@ func TestPipeline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	seeder := func(ctx context.Context, s Stage, ch Channel) {
+		for i := 0; i < 10000; i++ {
+			ch.Set(fmt.Sprintf("data#%d", i))
+		}
+		ch.Close()
+	}
+
+	consumer1 := func(ctx context.Context, s Stage, ch Channel) {
+		ch.Get(func(data interface{}) {
+			ch.Set(fmt.Sprintf("%s#modified", data.(string)))
+		})
+		ch.Close()
+	}
+
+	consumer2 := func(ctx context.Context, s Stage, ch Channel) {
+		ch.Get(func(data interface{}) {
+			database.Collection("pipeline").InsertOne(ctx, bson.D{bson.E{Key: "data", Value: data.(string)}})
+		})
+	}
+
 	pipe := NewPipeline(ctx)
-	pipe.AddStage("seeder", 1, func(ctx context.Context, s Stage, wi int) {
-		for i := 0; i < 1000; i++ {
-			s.SetDataFunc(func() interface{} {
-				return fmt.Sprintf("data#%d", i)
-			})
-		}
-		s.CloseData()
-	})
-	pipe.AddStage("consumer1", 5, func(ctx context.Context, s Stage, wi int) {
-		for d := range s.PrevStage().GetData() {
-			s.SetDataFunc(func() interface{} {
-				return fmt.Sprintf("%s#modified", d.(string))
-			})
-		}
-		s.CloseData()
-	})
-	pipe.AddStage("consumer2", 3, func(ctx context.Context, s Stage, wi int) {
-		for d := range s.PrevStage().GetData() {
-			database.Collection("pipeline").InsertOne(ctx, bson.D{bson.E{Key: "data", Value: d.(string)}})
-		}
-	})
-	// go func() {
-	// 	for {
-	// 		seeder := pipe.GetStageFrom("seeder")
-	// 		consumer1 := pipe.GetStageFrom("consumer1")
-	// 		consumer2 := pipe.GetStageFrom("consumer2")
-	// 		fmt.Printf("pipeline [seeder] have %d worker, channel length %d\n", seeder.GetActiveWorker(), seeder.GetLenChan())
-	// 		fmt.Printf("pipeline [consumer1] have %d worker, channel length %d\n", consumer1.GetActiveWorker(), consumer1.GetLenChan())
-	// 		fmt.Printf("pipeline [consumer2] have %d worker, channel length %d\n", consumer2.GetActiveWorker(), consumer2.GetLenChan())
-	// 		time.Sleep(time.Second)
-	// 	}
-	// }()
+	pipe.AddStage("seeder", 1, seeder)
+	pipe.AddStage("consumer1", 5, consumer1)
+	pipe.AddStage("consumer2", 5, consumer2)
 	pipe.Start()
 }
 

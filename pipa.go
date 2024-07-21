@@ -4,99 +4,111 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
+type Channel interface {
+	Set(d interface{})
+	Get(fn func(data interface{}))
+	Close()
+}
+
+type channel struct {
+	ID    int
+	Stage *stage
+}
+
+func (c *channel) Set(d interface{}) {
+	if c.Stage.Worker.Numbers > 1 {
+		c.Stage.WorkerChannel[c.ID] <- d
+	} else {
+		c.Stage.MainChannel <- d
+	}
+}
+
+func (c *channel) Get(fn func(data interface{})) {
+	if prev := c.Stage.PrevStage(); prev != nil {
+		for d := range prev.GetMainChannel() {
+			fn(d)
+		}
+	} else {
+		for d := range c.Stage.GetMainChannel() {
+			fn(d)
+		}
+	}
+}
+
+func (c *channel) Close() {
+	if c.Stage.Worker.Numbers > 1 {
+		close(c.Stage.WorkerChannel[c.ID])
+	} else {
+		c.Stage.CloseData()
+	}
+}
+
 type Stage interface {
-	CloseData()
 	GetStageID() string
-	IsDataClosed() bool
 	GetActiveWorker() int
-	GetLenChan() int
-	SetData(d interface{})
-	SetDataFunc(func() interface{})
-	GetData() chan interface{}
+	GetMainChannel() chan interface{}
 	CatchPanic(func(error))
 	Pipe() Pipeliner
 	NextStage() Stage
 	PrevStage() Stage
 }
 
-type stageChan struct {
-	sync.Mutex
-	Data chan interface{}
-}
-
-type stageFn func(ctx context.Context, s Stage, workerIndex int)
+type stageFn func(ctx context.Context, s Stage, ch Channel)
 
 type stageWorker struct {
-	mutex   *sync.Mutex
+	sync.Mutex
 	Numbers int
 	Active  int
 }
 
 type stage struct {
-	ID       string
-	Index    int
-	Worker   stageWorker
-	Chan     stageChan
-	ExecFn   stageFn
-	Pipeline *pipeline
+	ID            string
+	Index         int
+	Worker        stageWorker
+	WorkerChannel []chan interface{}
+	MainChannel   chan interface{}
+	ExecFn        stageFn
+	Pipeline      *pipeline
 }
 
-func (s *stage) GetData() chan interface{} {
-	s.Chan.Lock()
-	defer s.Chan.Unlock()
-	return s.Chan.Data
+func (s *stage) Channel(i int) Channel {
+	return &channel{
+		ID:    i,
+		Stage: s,
+	}
+}
+
+func (s *stage) GetMainChannel() chan interface{} {
+	return s.MainChannel
 }
 
 func (s *stage) SetData(d interface{}) {
-	s.Chan.Data <- d
-}
-
-func (s *stage) SetDataFunc(fn func() interface{}) {
-	s.Chan.Lock()
-	defer s.Chan.Unlock()
-	if s.Chan.Data == nil {
-		s.Chan.Data = make(chan interface{}, s.Worker.Numbers)
-	}
-	s.Chan.Data <- fn()
-}
-
-func (s *stage) SetActiveWorker(d int) {
-	s.Worker.mutex.Lock()
-	defer s.Worker.mutex.Unlock()
-	if d >= 0 {
-		s.Worker.Active++
-	} else {
-		s.Worker.Active--
-	}
-}
-
-func (s *stage) GetActiveWorker() int {
-	s.Worker.mutex.Lock()
-	defer s.Worker.mutex.Unlock()
-	return s.Worker.Active
-}
-
-func (s *stage) GetLenChan() int {
-	s.Chan.Lock()
-	defer s.Chan.Unlock()
-	return len(s.Chan.Data)
+	s.MainChannel <- d
 }
 
 func (s *stage) CloseData() {
-	if s.GetActiveWorker() == 1 {
-		close(s.Chan.Data)
-	}
+	close(s.MainChannel)
 }
 
-func (s *stage) IsDataClosed() bool {
-	select {
-	case <-s.Chan.Data:
-		return true
-	default:
-	}
-	return false
+func (s *stage) IncreaseActiveWorker() {
+	s.Worker.Lock()
+	defer s.Worker.Unlock()
+	s.Worker.Active++
+}
+
+func (s *stage) DecreaseActiveWorker() {
+	s.Worker.Lock()
+	defer s.Worker.Unlock()
+	s.Worker.Active--
+}
+
+func (s *stage) GetActiveWorker() int {
+	s.Worker.Lock()
+	defer s.Worker.Unlock()
+	return s.Worker.Active
 }
 
 func (s *stage) GetStageID() string {
@@ -128,11 +140,10 @@ func (s *stage) PrevStage() Stage {
 }
 
 type Pipeliner interface {
-	AddStage(id string, worker int, fn stageFn)
 	Start()
-	GetDataStageFrom(id string) chan interface{}
+	Monitor()
 	GetStageFrom(id string) Stage
-	GetAllStage() []Stage
+	AddStage(id string, worker int, fn stageFn)
 }
 
 type pipeline struct {
@@ -147,35 +158,36 @@ func NewPipeline(ctx context.Context) Pipeliner {
 }
 
 func (p *pipeline) AddStage(id string, numWorkers int, fn stageFn) {
-	p.stages = append(p.stages, &stage{
-		ID:       id,
-		ExecFn:   fn,
-		Pipeline: p,
-		Worker:   stageWorker{Numbers: numWorkers, mutex: &sync.Mutex{}},
-	})
-}
-
-func (p *pipeline) GetAllStage() []Stage {
-	stages := []Stage{}
-	for _, v := range p.stages {
-		stages = append(stages, v)
+	if numWorkers < 1 {
+		numWorkers = 1
 	}
-	return stages
+
+	var wch []chan interface{}
+	for i := 0; i < numWorkers; i++ {
+		wch = append(wch, make(chan interface{}))
+	}
+
+	var mch chan interface{}
+	if numWorkers == 1 {
+		mch = wch[0]
+	} else {
+		mch = make(chan interface{})
+	}
+
+	p.stages = append(p.stages, &stage{
+		ID:            id,
+		ExecFn:        fn,
+		Pipeline:      p,
+		Worker:        stageWorker{Numbers: numWorkers},
+		MainChannel:   mch,
+		WorkerChannel: wch,
+	})
 }
 
 func (p *pipeline) GetStageFrom(id string) Stage {
 	for _, s := range p.stages {
 		if s.ID == id {
 			return s
-		}
-	}
-	return nil
-}
-
-func (p *pipeline) GetDataStageFrom(id string) chan interface{} {
-	for _, s := range p.stages {
-		if s.ID == id {
-			return s.Chan.Data
 		}
 	}
 	return nil
@@ -190,25 +202,44 @@ func (p *pipeline) Start() {
 		s.Index = pos
 		for i := 0; i < s.Worker.Numbers; i++ {
 			w.Add(1)
-			s.SetActiveWorker(1)
 			go p.run(&w, s, i)
+		}
+		if len(s.WorkerChannel) > 1 {
+			w2 := sync.WaitGroup{}
+			w2.Add(len(s.WorkerChannel))
+			for _, ch := range s.WorkerChannel {
+				go func(w2 *sync.WaitGroup) {
+					defer w2.Done()
+					for d := range ch {
+						s.SetData(d)
+					}
+				}(&w2)
+			}
+			go func() {
+				w2.Wait()
+				close(s.MainChannel)
+			}()
 		}
 	}
 	w.Wait()
-	// make sure all channel closed when all stages is completed
-	for _, v := range p.stages {
-		v.CloseData()
-	}
+}
+
+func (p *pipeline) Monitor() {
+	go func() {
+		for {
+			for i := 0; i < len(p.stages); i++ {
+				stage := p.stages[i]
+				fmt.Printf("pipeline [%s] \t worker numbers [%d] <> active [%d]\n", stage.ID, stage.Worker.Numbers, stage.GetActiveWorker())
+			}
+			fmt.Println("-----------------------")
+			time.Sleep(time.Second)
+		}
+	}()
 }
 
 func (p *pipeline) run(wg *sync.WaitGroup, s *stage, workerIndex int) {
 	defer wg.Done()
-	defer s.SetActiveWorker(-1)
-	defer s.CatchPanic(func(err error) {
-		fmt.Println("Panic on worker stage", s.GetStageID(), "err", err.Error())
-		if s.GetActiveWorker() == 1 {
-			s.CloseData()
-		}
-	})
-	s.ExecFn(p.ctx, s, workerIndex)
+	defer s.DecreaseActiveWorker()
+	s.IncreaseActiveWorker()
+	s.ExecFn(p.ctx, s, s.Channel(workerIndex))
 }
